@@ -22,12 +22,25 @@ from .views import NoteDetailAPIViewBot
 from .views import SearchNotesByTagAndQueryAPIView
 from .views import NotesByCategoryIdAPIView
 from .views import TelemetryFromJsonl
+from .views_map import (
+    board_session_map, board_session_data,
+    list_boards, list_sessions,
+    export_gpx, export_kml,
+)
 
 
 urlpatterns = [
     
+    path("track/board/<int:board_id>/session/<str:sess>/", board_session_map),
+    path("track/data/board/<int:board_id>/session/<str:sess>/", board_session_data),
+
+    path("track/boards/", list_boards),
+    path("track/sessions/board/<int:board_id>/", list_sessions),
+
+    path("track/export/gpx/board/<int:board_id>/session/<str:sess>/", export_gpx),
+    path("track/export/kml/board/<int:board_id>/session/<str:sess>/", export_kml),
+    
     # телеметрия с бортов
-    path('telemetry/', TelemetryFromJsonl.as_view(), name='telemetry'),
     
     
     # бот пути

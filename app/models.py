@@ -16,17 +16,35 @@ class Board(models.Model):
     status = models.CharField(max_length=50, blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
-    # online-«сводка»
+    # online summary
     is_online = models.BooleanField(default=False, db_index=True)
     online_since = models.DateTimeField(blank=True, null=True)
     last_telemetry_at = models.DateTimeField(blank=True, null=True)
     last_mode = models.CharField(max_length=64, blank=True, null=True)
     last_volt = models.FloatField(blank=True, null=True)
 
+    # last known coordinates
+    last_lat = models.FloatField(null=True, blank=True)
+    last_lon = models.FloatField(null=True, blank=True)
+
+    # first-position notification after current power-on
+    last_pos_reported_at = models.DateTimeField(null=True, blank=True)
+
+    # active telemetry session id for the current online run
+    current_sess = models.CharField(max_length=64, blank=True, null=True, db_index=True)
+
+    # offline tracking + notifications
+    offline_since = models.DateTimeField(null=True, blank=True)
+    last_offline_notified_at = models.DateTimeField(null=True, blank=True)          # stage 1 (3m)
+    prolonged_offline_notified_at = models.DateTimeField(null=True, blank=True)     # stage 2 (10m)
+
     class Meta:
-        verbose_name = 'Board'
-        verbose_name_plural = 'Boards'
-        db_table = 'boards'
+        verbose_name = "Board"
+        verbose_name_plural = "Boards"
+        db_table = "boards"
+        indexes = [
+            models.Index(fields=["is_online", "last_telemetry_at"]),
+        ]
 
     def __str__(self):
         return f"Board #{self.boat_number}"
@@ -60,7 +78,7 @@ class Telemetry(models.Model):
         db_table = "telemetry"   # <<< добавь это, если хочешь ровно public.telemetry
         indexes = [
             models.Index(fields=["board", "ts"]),
-            models.Index(fields=["sess", "seq"]),
+            models.Index(fields=["board", "sess", "ts"]),
         ]
         constraints = [
             models.UniqueConstraint(

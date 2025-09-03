@@ -1,11 +1,17 @@
 from datetime import timedelta
 from pathlib import Path
 import os
+from dotenv import load_dotenv
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env")
+
+from celery.schedules import crontab
 
 from dotenv import load_dotenv
 
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
-BASE_DIR = Path(__file__).resolve().parent.parent
 
 
 from celery.schedules import crontab
@@ -18,7 +24,7 @@ from celery.schedules import crontab
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY")
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = False
+DEBUG = True
 
 # ALLOWED_HOSTS = ['*']
 ALLOWED_HOSTS = ["sova-aero.ru", "www.sova-aero.ru", "127.0.0.1", "localhost"]
@@ -40,10 +46,11 @@ MEDIA_URL = '/media/'
 
 STATIC_ROOT = os.path.join(BASE_DIR, 'static')
 
-# celery
-BASE_DIR = Path(__file__).resolve().parent.parent
-load_dotenv(BASE_DIR / ".env")   # <— очень важно для Celery/Windows
 
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000")  # прод: https://sova-aero.ru
+
+
+# celery
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_THREAD_ID = os.getenv("TELEGRAM_THREAD_ID", "")
@@ -52,11 +59,17 @@ CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL")
 CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND")
 CELERY_TIMEZONE = "Europe/Moscow"
 
+
+
+ONLINE_INACTIVE_MIN = int(os.getenv("ONLINE_INACTIVE_MIN", "1"))
+PROLONGED_OFFLINE_MIN = int(os.getenv("PROLONGED_OFFLINE_MIN", "2"))
+
+
 CELERY_BEAT_SCHEDULE = {
     "check-offline-every-minute": {
-        "task": "djangoBackend.tasks.check_offline_boards",
-        "schedule": crontab(),  # каждую минуту
-        "args": (3,),           # таймаут 3 минуты
+        "task": "api_v1.tasks.check_offline_boards",
+        "schedule": crontab(),
+        "args": (ONLINE_INACTIVE_MIN, PROLONGED_OFFLINE_MIN),
     },
 }
 
