@@ -2,7 +2,7 @@
 from django.conf import settings
 from django.conf.urls.static import static
 from django.urls import path
-from .views import AuthUserDetailView, CategoryDetailAPIViewBot
+from .views import AuthUserDetailView, BoardMovementCreateView, BoardSectionListView, BoardSectionTransferCreateView, BoardSectionTransferHistoryView, BoardStatusActiveListView, CategoryDetailAPIViewBot
 from .views import CustomLoginAPIView
 from .views import NewEntryAPIView
 from .views import PopularNotesAPIView
@@ -30,6 +30,9 @@ from .views_map import (
 from .views import ArmReportIngestView
 from .views import TelemetryFromJsonl
 
+from .views import BoardSerialUpsertView
+
+
 urlpatterns = [
     
     path("arm-report/", ArmReportIngestView.as_view(), name="arm-report"),
@@ -45,6 +48,19 @@ urlpatterns = [
     
     # телеметрия с бортов
     path("telemetry/", TelemetryFromJsonl.as_view(), name="telemetry_ingest"),
+    
+    
+    # бот работа с бортами
+    path("boards/statuses/active/", BoardStatusActiveListView.as_view(), name="boards-statuses-active"),
+    path("boards/sections/list/", BoardSectionListView.as_view(), name="boards-sections-list"),
+    
+    path("boards/sections/transfer/", BoardSectionTransferCreateView.as_view(), name="boards-sections-transfer"),
+    path("boards/sections/history/", BoardSectionTransferHistoryView.as_view(), name="boards-sections-history"),
+    
+    path("boards/serial/upsert/", BoardSerialUpsertView.as_view(), name="boards-serial-upsert"),
+    
+    path("boards/movements/add/", BoardMovementCreateView.as_view(), name="boards-movements-add"),
+    
     
     # бот пути
     

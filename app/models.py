@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.utils import timezone
 from django.db import models
 from django.contrib.auth.hashers import make_password
@@ -38,6 +39,15 @@ class Board(models.Model):
     last_offline_notified_at = models.DateTimeField(null=True, blank=True)          # stage 1 (3m)
     prolonged_offline_notified_at = models.DateTimeField(null=True, blank=True)     # stage 2 (10m)
 
+    current_section = models.ForeignKey(
+        "BoardSection",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="boards",
+        db_index=True,
+    )
+
     class Meta:
         verbose_name = "Board"
         verbose_name_plural = "Boards"
@@ -48,6 +58,111 @@ class Board(models.Model):
 
     def __str__(self):
         return f"Board #{self.boat_number}"
+
+class BoardSection(models.Model):
+    code = models.SlugField(max_length=50, unique=True, db_index=True)
+    name = models.CharField(max_length=100)
+    description = models.TextField(blank=True, null=True)
+    order = models.PositiveIntegerField(default=100)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "board_sections"
+        ordering = ["order", "id"]
+
+    def __str__(self):
+        return f"{self.name} ({self.code})"
+
+
+class BoardSectionTransfer(models.Model):
+    board = models.ForeignKey(Board, on_delete=models.CASCADE, related_name="section_transfers", db_index=True)
+
+    from_section = models.ForeignKey(BoardSection, on_delete=models.SET_NULL, null=True, blank=True, related_name="as_from")
+    to_section   = models.ForeignKey(BoardSection, on_delete=models.PROTECT, related_name="as_to", db_index=True)
+
+    notes = models.TextField(blank=True, null=True)
+
+    SOURCE_CHOICES = [("bot", "Telegram Bot"), ("admin", "Admin"), ("api", "API")]
+    source = models.CharField(max_length=16, choices=SOURCE_CHOICES, default="bot")
+
+    submitted_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
+    submitted_display = models.CharField(max_length=150, blank=True, null=True)
+
+    context = models.JSONField(default=dict, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    effective_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "board_section_transfers"
+        indexes = [
+            models.Index(fields=["board", "-created_at"]),
+            models.Index(fields=["to_section", "created_at"]),
+        ]
+        ordering = ["-created_at", "id"]
+
+    def __str__(self):
+        return f"Board #{self.board.boat_number}: {self.from_section} -> {self.to_section}"
+
+
+class BoardStatus(models.Model):
+    code = models.SlugField(max_length=50, unique=True, db_index=True)
+    name = models.CharField(max_length=100)
+    description = models.TextField(blank=True, null=True)
+    order = models.PositiveIntegerField(default=100)
+    is_active = models.BooleanField(default=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "board_statuses"
+        ordering = ["order", "id"]
+
+    def __str__(self):
+        return f"{self.name} ({self.code})"
+
+
+class BoardMovement(models.Model):
+    board = models.ForeignKey(Board, on_delete=models.CASCADE, related_name="movements", db_index=True)
+
+    previous_status = models.ForeignKey(
+        BoardStatus, on_delete=models.SET_NULL, null=True, blank=True, related_name="as_previous"
+    )
+    new_status = models.ForeignKey(
+        BoardStatus, on_delete=models.PROTECT, related_name="as_new", db_index=True
+    )
+
+    notes = models.TextField(blank=True, null=True)
+
+    # 1) откуда пришло
+    SOURCE_CHOICES = [("bot", "Telegram Bot"), ("admin", "Admin"), ("api", "API")]
+    source = models.CharField(max_length=16, choices=SOURCE_CHOICES, default="bot")
+
+    # 2) кто отправил (пользователь системы, если нашли)
+    submitted_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
+    # если сопоставить с пользователем не удалось — сохраняем подпись вида "@Deim0sAA"
+    submitted_display = models.CharField(max_length=150, blank=True, null=True)
+
+    # произвольный контекст: камера/готовность/тред/файлы/цех и т.п.
+    context = models.JSONField(default=dict, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    effective_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "board_movements"
+        indexes = [
+            models.Index(fields=["board", "-created_at"]),
+            models.Index(fields=["new_status", "created_at"]),
+        ]
+        ordering = ["-created_at", "id"]
+
+    def __str__(self):
+        who = self.submitted_display or (getattr(self.submitted_by, "username", None) or "?")
+        return f"Board #{self.board.boat_number}: {self.previous_status} → {self.new_status} by {who}"
 
 
 class Telemetry(models.Model):

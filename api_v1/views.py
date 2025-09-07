@@ -28,7 +28,10 @@ from rest_framework.parsers import MultiPartParser, FormParser
 
 from collections import defaultdict
 
-from app.models import ArmReport, Note, AuthUser, Category, Photo, Video, Board, Telemetry
+from app.models import (
+    ArmReport, BoardSection, BoardStatus, Note, AuthUser, Category, Photo, Video, Board, Telemetry,
+    BoardSectionTransfer
+)
 
 from .urils.add_reaction import add_reaction
 
@@ -45,6 +48,12 @@ from .serializers import NoteSerializer
 
 from .serializers import NoteSerializerBot
 from .serializers import NoteDetailSerializerBot
+from .serializers import BoardMovementCreateSerializer
+from .serializers import BoardMovementOutSerializer
+from .serializers import (
+    BoardSectionTransferCreateSerializer,
+    BoardSectionTransferOutSerializer,
+)
 
 
 # обработка запросов с бортов
@@ -299,8 +308,110 @@ class TelemetryFromJsonl(APIView):
     def get(self, request, *args, **kwargs):
         return Response({"status": "ok"}, status=200)
 
+"""
+апи для бота
+"""
 
-# апи для бота
+class BoardStatusActiveListView(APIView):
+    """
+    GET /api/v1/boards/statuses/active/
+    -> {"items":[{"code":"flown","name":"Облётан"}, ...]}
+    """
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs = BoardStatus.objects.filter(is_active=True).order_by("order", "id")
+        items = [{"code": s.code, "name": s.name} for s in qs]
+        return Response({"items": items})
+
+
+class BoardSectionListView(APIView):
+    """
+    GET /api/v1/boards/sections/list/
+    -> {"items":[{"code":"section4","name":"4-й участок"}, ...]}
+    """
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs = BoardSection.objects.filter(is_active=True).order_by("order", "id")
+        items = [{"code": s.code, "name": s.name} for s in qs]
+        return Response({"items": items})
+
+class BoardSectionTransferCreateView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        print(">>> TRANSFER POST payload:", request.data)  # <-- временный лог
+        ser = BoardSectionTransferCreateSerializer(data=request.data, context={"request": request})
+        ser.is_valid(raise_exception=True)
+        tr = ser.save()
+        print(">>> TRANSFER CREATED id:", tr.id, " board:", tr.board.boat_number, " to:", tr.to_section.code)
+        out = BoardSectionTransferOutSerializer(tr).data
+        return Response({"ok": True, "item": out}, status=status.HTTP_201_CREATED)
+
+
+class BoardSectionTransferHistoryView(APIView):
+    """
+    GET /api/v1/boards/sections/history/?boat=7
+    """
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        boat = request.query_params.get("boat")
+        if not boat:
+            return Response({"detail": "boat is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            board = Board.objects.get(boat_number=int(boat))
+        except Board.DoesNotExist:
+            return Response({"detail": "board not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        qs = BoardSectionTransfer.objects.filter(board=board).order_by("-created_at")[:200]
+        data = BoardSectionTransferOutSerializer(qs, many=True).data
+        return Response({"ok": True, "items": data}, status=status.HTTP_200_OK)
+
+
+class BoardMovementCreateView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        ser = BoardMovementCreateSerializer(data=request.data, context={"request": request})
+        ser.is_valid(raise_exception=True)
+        movement = ser.save()
+        out = BoardMovementOutSerializer(movement).data
+        return Response({"ok": True, "item": out}, status=status.HTTP_201_CREATED)
+
+
+
+class BoardSerialUpsertView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        boat_number = request.data.get("boat")
+        serial = request.data.get("serial")
+
+        if not boat_number or not serial:
+            return Response({"detail": "boat and serial are required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        board, created = Board.objects.get_or_create(
+            boat_number=boat_number,
+            defaults={"serial_number": serial},
+        )
+        if not created:
+            board.serial_number = serial
+            board.save(update_fields=["serial_number"])
+
+        return Response(
+            {"ok": True, "created": created, "boat_number": board.boat_number, "serial_number": board.serial_number},
+            status=status.HTTP_200_OK,
+        )
+
 
 class SearchNotesByTagAndQueryAPIView(APIView):
     """

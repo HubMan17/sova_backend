@@ -1,12 +1,22 @@
 import re
-from django.utils import dateparse, timezone
 from rest_framework import serializers
 from rest_framework_simplejwt.tokens import RefreshToken
-from django.contrib.auth.hashers import check_password
 
-from app.models import AuthUser, Note, Tags, Category, Photo, Video, UserRank, Telemetry, Board
+from django.db.models import Q
+
+from typing import Tuple, Optional
+
+from django.utils import dateparse, timezone
+from django.contrib.auth.hashers import check_password
+from django.contrib.auth import get_user_model
+from django.db import transaction
+
+from app.models import AuthUser, BoardMovement, BoardSection, BoardSectionTransfer, BoardStatus, Note, Tags, Category, Photo, Video, UserRank, Telemetry, Board
 
 from api_v1.urils.telemetry_utils import maybe_mark_power_on
+
+
+User = get_user_model()
 
 
 # сериализатор для телема
@@ -83,8 +93,276 @@ class TelemetryInSerializer(serializers.Serializer):
         return tel
 
 
+"""
+Сериализатор для бота
+"""      
+def resolve_submitted_user(raw_author: str | None):
+    if not raw_author:
+        return None, None
+    a = (raw_author or "").strip()
+    if a.lower().startswith("id:"):
+        return None, a
+    handle = a.lstrip("@").strip()
+    display = f"@{handle}" if handle else None
+    q = Q(username__iexact=handle)
+    if any(f.name == "name" for f in User._meta.get_fields()):
+        q |= Q(name__iexact=handle)
+    user = User.objects.filter(q).first()
+    return user, display
 
-# сериализаторы для бота        
+def resolve_user(author_str: Optional[str]) -> Tuple[Optional[User], Optional[str]]:
+    if not author_str:
+        return None, None
+    original = author_str.strip()
+    if not original:
+        return None, None
+    handle = original.lstrip("@").strip()  # убираем '@'
+    user = User.objects.filter(username__iexact=handle).first()
+    if user:
+        return user, None
+    # (по желанию можно расширить поиском по name/email)
+    return None, handle  # сохраним подпись без '@'
+
+def get_status_by_code_or_name(code: str, fallback_name: Optional[str] = None) -> Optional[BoardStatus]:
+    # сперва по code
+    obj = BoardStatus.objects.filter(code=code, is_active=True).first()
+    if obj:
+        return obj
+    # опционально по имени (если кодов ещё нет)
+    if fallback_name:
+        return BoardStatus.objects.filter(name=fallback_name, is_active=True).first()
+    return None
+
+# маппинг: куда перевели -> какой статус ставим
+SECTION_TO_STATUS = {
+    "section4": ("to_section4", "Передан на 4-й участок"),
+    "section5": ("accepted_section5", "Принят на 5-й участок"),
+    # при необходимости добавь другие: "section3": ("accepted_section3", "Принят на 3-й участок")
+}
+
+class BoardSectionTransferCreateSerializer(serializers.Serializer):
+    boat = serializers.IntegerField()
+    to_section_code = serializers.SlugField()
+    notes = serializers.CharField(required=False, allow_blank=True, default="")
+    source = serializers.CharField(required=False, allow_blank=True, default="api")
+    author = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    context = serializers.JSONField(required=False)
+    effective_at = serializers.DateTimeField(required=False, allow_null=True)
+    from_section_code = serializers.SlugField(required=False, allow_blank=True, allow_null=True)
+
+    @transaction.atomic
+    def create(self, validated_data):
+        from app.models import Board, BoardSection, BoardSectionTransfer  # поправь путь
+        boat = validated_data["boat"]
+        to_code = validated_data["to_section_code"]
+        notes = validated_data.get("notes") or ""
+        source = validated_data.get("source") or "api"
+        context = validated_data.get("context") or {}
+        effective_at = validated_data.get("effective_at")
+        from_code = validated_data.get("from_section_code") or None
+
+        board = Board.objects.get(boat_number=boat)
+        to_section = BoardSection.objects.get(code=to_code)
+
+        # определить from_section: явный параметр или текущее поле у board (если есть)
+        from_section = None
+        if from_code:
+            from_section = BoardSection.objects.filter(code=from_code).first()
+        elif hasattr(board, "current_section_id"):
+            from_section = board.current_section
+
+        submitted_by, submitted_display = resolve_submitted_user(validated_data.get("author"))
+
+        tr = BoardSectionTransfer.objects.create(
+            board=board,
+            from_section=from_section,
+            to_section=to_section,
+            notes=notes,
+            source=source,
+            submitted_by=submitted_by,
+            submitted_display=submitted_display,
+            context=context,
+            effective_at=effective_at,
+        )
+
+        # синхронизируем текущее поле у Board, если есть
+        if hasattr(board, "current_section_id") and board.current_section_id != to_section.id:
+            board.current_section = to_section
+            board.save(update_fields=["current_section"])
+
+        # (если нужен автостатус по маппингу, оставь как было)
+        return tr
+
+class BoardSectionTransferOutSerializer(serializers.ModelSerializer):
+    board = serializers.SerializerMethodField()
+    from_section = serializers.SerializerMethodField()
+    to_section = serializers.SerializerMethodField()
+    submitted_by = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BoardSectionTransfer
+        fields = (
+            "id", "board", "from_section", "to_section",
+            "notes", "source", "submitted_by", "submitted_display",
+            "context", "effective_at", "created_at",
+        )
+        read_only_fields = fields
+
+    def get_board(self, obj):
+        return getattr(obj.board, "boat_number", None)
+
+    def get_from_section(self, obj):
+        return getattr(obj.from_section, "code", None)
+
+    def get_to_section(self, obj):
+        return getattr(obj.to_section, "code", None)
+
+    def get_submitted_by(self, obj):
+        return getattr(obj.submitted_by, "username", None)
+
+
+
+def resolve_user_by_author_str(author_str: Optional[str]) -> Tuple[Optional[User], Optional[str]]:
+    """
+    Принимает строку автора (напр. '@Deim0sAA' или 'Deim0sAA').
+    Возвращает (user|None, display|None). display сохраняем ТОЛЬКО если user не найден.
+    Алгоритм:
+      - срезаем ведущий '@'
+      - ищем по username (без учёта регистра)
+      - если в кастомной модели пользователя есть поле 'name' — ищем по нему
+      - пробуем по email
+      - если не нашли — возвращаем display БЕЗ '@'
+    """
+    if not author_str:
+        return None, None
+
+    original = author_str.strip()
+    if not original:
+        return None, None
+
+    handle = original.lstrip("@").strip()  # <<< убрали '@'
+
+    # 1) username (основной кейс)
+    user = User.objects.filter(username__iexact=handle).first()
+    if user:
+        return user, None
+
+    # 2) кастомное поле 'name', если оно есть в модели
+    user_field_names = {f.name for f in User._meta.get_fields()}
+    if "name" in user_field_names:
+        user = User.objects.filter(name__iexact=handle).first()
+        if user:
+            return user, None
+        # Если в БД 'name' хранится вместе с '@', попробуем и с оригиналом
+        if original.startswith("@"):
+            user = User.objects.filter(name__iexact=original).first()
+            if user:
+                return user, None
+
+    # 3) email (на всякий)
+    if "email" in user_field_names:
+        user = User.objects.filter(email__iexact=handle).first()
+        if user:
+            return user, None
+
+    # 4) не нашли — сохраняем подпись без '@'
+    return None, handle
+
+
+class BoardMovementCreateSerializer(serializers.Serializer):
+    boat = serializers.IntegerField()
+    status_code = serializers.SlugField()
+    notes = serializers.CharField(required=False, allow_blank=True, default="")
+    source = serializers.CharField(required=False, allow_blank=True, default="api")
+    author = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    context = serializers.JSONField(required=False)
+    effective_at = serializers.DateTimeField(required=False, allow_null=True)
+
+    @transaction.atomic
+    def create(self, validated_data):
+        # поправь импорт под твои пути
+        from app.models import Board, BoardStatus, BoardMovement
+
+        boat = validated_data["boat"]
+        new_code = validated_data["status_code"]
+        notes = validated_data.get("notes") or ""
+        source = validated_data.get("source") or "api"
+        context = validated_data.get("context") or {}
+        effective_at = validated_data.get("effective_at")
+
+        # блокируем строку борта, чтобы не было гонок
+        board = Board.objects.select_for_update().get(boat_number=boat)
+
+        # новый статус — объект
+        new_status = BoardStatus.objects.get(code=new_code)
+
+        # предыдущий статус борта хранится у Board как строковый код -> ищем объект (или None)
+        prev_status_obj = None
+        prev_code = getattr(board, "status", None)
+        if prev_code:
+            prev_status_obj = BoardStatus.objects.filter(code=prev_code).first()
+
+        submitted_by, submitted_display = resolve_submitted_user(validated_data.get("author"))
+
+        mv = BoardMovement.objects.create(
+            board=board,
+            previous_status=prev_status_obj,  # <-- ВАЖНО: объект, а не строка
+            new_status=new_status,
+            notes=notes,
+            source=source,
+            submitted_by=submitted_by,
+            submitted_display=submitted_display,
+            context=context,
+            effective_at=effective_at,
+        )
+
+        # синхронизируем текущий код статуса в самой Board
+        board.status = new_status.code
+        board.save(update_fields=["status"])
+
+        return mv
+
+
+class BoardMovementOutSerializer(serializers.ModelSerializer):
+    board = serializers.SerializerMethodField()
+    previous_status = serializers.SerializerMethodField()
+    new_status = serializers.SerializerMethodField()
+    new_status_name = serializers.SerializerMethodField()
+    submitted_by = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BoardMovement
+        fields = (
+            "id",
+            "board",
+            "previous_status",
+            "new_status",
+            "new_status_name",
+            "notes",
+            "source",
+            "submitted_by",
+            "submitted_display",
+            "context",
+            "effective_at",
+            "created_at",
+        )
+        read_only_fields = fields
+
+    def get_board(self, obj):  # boat_number
+        return getattr(obj.board, "boat_number", None)
+
+    def get_previous_status(self, obj):
+        return getattr(obj.previous_status, "code", None)
+
+    def get_new_status(self, obj):
+        return getattr(obj.new_status, "code", None)
+
+    def get_new_status_name(self, obj):
+        return getattr(obj.new_status, "name", None)
+
+    def get_submitted_by(self, obj):
+        return getattr(obj.submitted_by, "username", None)
+
 
 class NoteDetailSerializerBot(serializers.ModelSerializer):
     """
