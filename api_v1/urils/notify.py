@@ -1,5 +1,7 @@
+import json
 import os
 import re
+from django.conf import settings
 import requests
 import logging
 from .route_map import build_yandex_route_url_v1
@@ -8,10 +10,22 @@ from urllib.parse import quote_plus
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TG_CHAT_ID", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")   or os.getenv("TG_CHAT_ID", "")
 TELEGRAM_THREAD_ID = os.getenv("TELEGRAM_THREAD_ID") or os.getenv("TG_THREAD_ID", "")
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
+
+def _has_creds() -> bool:
+    ok = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+    if not ok:
+        logger.error("Telegram credentials are missing (token or chat id)")
+    return ok
+
+def _normalize_thread_id(x):
+    try:
+        return int(x) if str(x).strip() else None
+    except Exception:
+        return None
 
 
 def _json_or_text(resp):
@@ -23,21 +37,51 @@ def _json_or_text(resp):
             return {"ok": False, "status_code": resp.status_code, "text": resp.text}
     return {"ok": False, "status_code": resp.status_code, "text": resp.text}
 
-def tg_send(text: str, parse_mode: str = "HTML") -> dict:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("Telegram credentials are missing")
-        return {"ok": False, "error": "Telegram credentials are missing"}
+def _post(method: str, payload: dict, timeout: int = 10) -> dict:
+    url = f"{BASE_URL}/{method}"
+    try:
+        r = requests.post(url, json=payload, timeout=timeout)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"ok": False, "status_code": r.status_code, "raw": r.text}
+        print(f"[tg] POST {method} → {r.status_code} | payload={json.dumps(payload, ensure_ascii=False)} | resp={json.dumps(data, ensure_ascii=False)}")
+        return data
+    except Exception as e:
+        print(f"[tg] ERROR request: {e!r}")
+        return {"ok": False, "error": repr(e)}
+
+def tg_send(text: str, parse_mode: str = "HTML", thread_id: int | str | None = None) -> dict:
+    if not _has_creds():
+        return {"ok": False, "error": "missing creds"}
+
+    # приоритет: явный thread_id аргумент > ENV
+    tid = _normalize_thread_id(thread_id) if thread_id is not None else _normalize_thread_id(TELEGRAM_THREAD_ID)
+
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": parse_mode,
         "disable_web_page_preview": True,
     }
-    if TELEGRAM_THREAD_ID:
-        payload["message_thread_id"] = int(TELEGRAM_THREAD_ID)
+    if tid is not None:
+        payload["message_thread_id"] = tid
+
     try:
         r = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=10)
         data = _json_or_text(r)
+
+        # если проблема именно с топиком — повторим без message_thread_id
+        if not data.get("ok"):
+            desc = (data.get("description") or "").lower()
+            if tid is not None and ("thread" in desc or "topic" in desc or "message_thread_id" in desc):
+                payload.pop("message_thread_id", None)
+                r2 = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=10)
+                data2 = _json_or_text(r2)
+                if not data2.get("ok"):
+                    logger.error("tg_send retry(no thread) error: %s", data2)
+                return data2
+
         if not data.get("ok"):
             logger.error("tg_send error: %s", data)
         return data
@@ -45,13 +89,35 @@ def tg_send(text: str, parse_mode: str = "HTML") -> dict:
         logger.exception("tg_send exception")
         return {"ok": False, "error": str(e)}
 
+# def tg_send(text: str, parse_mode: str = "HTML") -> dict:
+#     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+#         logger.error("Telegram credentials are missing")
+#         return {"ok": False, "error": "Telegram credentials are missing"}
+#     payload = {
+#         "chat_id": TELEGRAM_CHAT_ID,
+#         "text": text,
+#         "parse_mode": parse_mode,
+#         "disable_web_page_preview": True,
+#     }
+#     if TELEGRAM_THREAD_ID:
+#         payload["message_thread_id"] = int(TELEGRAM_THREAD_ID)
+#     try:
+#         r = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=10)
+#         data = _json_or_text(r)
+#         if not data.get("ok"):
+#             logger.error("tg_send error: %s", data)
+#         return data
+#     except Exception as e:
+#         logger.exception("tg_send exception")
+#         return {"ok": False, "error": str(e)}
+
 def tg_send_location(lat: float, lon: float) -> dict:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("Telegram credentials are missing")
-        return {"ok": False, "error": "Telegram credentials are missing"}
+    if not _has_creds():
+        return {"ok": False, "error": "missing creds"}
     payload = {"chat_id": TELEGRAM_CHAT_ID, "latitude": float(lat), "longitude": float(lon)}
-    if TELEGRAM_THREAD_ID:
-        payload["message_thread_id"] = int(TELEGRAM_THREAD_ID)
+    tid = _normalize_thread_id(TELEGRAM_THREAD_ID)
+    if tid is not None:
+        payload["message_thread_id"] = tid
     try:
         r = requests.post(f"{BASE_URL}/sendLocation", json=payload, timeout=10)
         data = _json_or_text(r)
@@ -147,4 +213,5 @@ def tg_send_route_map(points, caption: str) -> dict:
 
     # фоллбэк — текст + интерактивная ссылка
     link = build_yandex_interactive_url(points)
-    return tg_send(caption + "\n🗺 " + link)
+    thread_id = getattr(settings, "TELEGRAM_THREAD_ID", None)
+    return tg_send(caption + "\n🗺 " + link, thread_id=thread_id)

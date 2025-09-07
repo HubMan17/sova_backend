@@ -92,6 +92,33 @@ class Telemetry(models.Model):
         return f"TEL #{self.board.boat_number} @ {self.ts}"
 
 
+class ArmReport(models.Model):
+    """
+    Сырые отчёты по ARM, прилетающие из внешней системы.
+    Привязываем к борту через FK по его внутреннему id (board),
+    но также храним boat_number на случай, если борта ещё нет.
+    """
+    board = models.ForeignKey('app.Board', on_delete=models.SET_NULL, null=True, blank=True, db_index=True)
+    boat_number = models.IntegerField(db_index=True)  # тот самый "boat" из запроса
+
+    ts = models.DateTimeField(db_index=True)          # метка отчёта (из поля "ts")
+    arms = models.IntegerField()
+    arm_sec = models.FloatField()
+    qstab_sec = models.FloatField()
+
+    # для идемпотентности: не сохраним дубль точь-в-точь
+    class Meta:
+        db_table = "arm_reports"
+        unique_together = (("boat_number", "ts", "arms", "arm_sec", "qstab_sec"),)
+        indexes = [
+            models.Index(fields=["boat_number", "ts"]),
+        ]
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"ArmReport(boat={self.boat_number}, ts={self.ts}, arms={self.arms})"
+
 class AuthGroup(models.Model):
     name = models.CharField(unique=True, max_length=150)
 

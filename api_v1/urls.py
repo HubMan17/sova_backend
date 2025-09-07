@@ -27,9 +27,12 @@ from .views_map import (
     list_boards, list_sessions,
     export_gpx, export_kml,
 )
-
+from .views import ArmReportIngestView
+from .views import TelemetryFromJsonl
 
 urlpatterns = [
+    
+    path("arm-report/", ArmReportIngestView.as_view(), name="arm-report"),
     
     path("track/board/<int:board_id>/session/<str:sess>/", board_session_map),
     path("track/data/board/<int:board_id>/session/<str:sess>/", board_session_data),
@@ -41,7 +44,7 @@ urlpatterns = [
     path("track/export/kml/board/<int:board_id>/session/<str:sess>/", export_kml),
     
     # телеметрия с бортов
-    
+    path("telemetry/", TelemetryFromJsonl.as_view(), name="telemetry_ingest"),
     
     # бот пути
     

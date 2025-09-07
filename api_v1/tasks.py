@@ -1,8 +1,13 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 from django.utils import timezone
 from django.db.models import Q
+
+from datetime import datetime, timezone as dt_tz
+
+from api_v1.urils.notify_format import ArmProgress, build_arm_report_message
+
 from celery import shared_task
-from app.models import Board
+from app.models import ArmReport, Board
 from api_v1.urils.notify import tg_send, tg_send_route_map
 from api_v1.urils.route_map import total_distance_m
 from api_v1.urils.route_query import (
@@ -14,8 +19,134 @@ from api_v1.urils.route_query import (
 import logging
 from django.conf import settings
 
+import os
+import requests
+
+from celery import shared_task
+from django.utils import timezone as tz
+from django.db import transaction
+
+
 logger = logging.getLogger(__name__)
 
+
+# === ГЛОБАЛЬНЫЕ ПОРОГИ (можно вынести в settings.py при желании) =============
+# Пороговые значения — пока глобалки (как и просили)
+ARM_LIMIT_COUNT = int(os.getenv("ARM_LIMIT_COUNT", "10"))     # например, 10
+ARM_LIMIT_TIME_S = float(os.getenv("ARM_LIMIT_TIME_S", "350"))  # 5м50с = 350с
+QSTAB_LIMIT_TIME_S = float(os.getenv("QSTAB_LIMIT_TIME_S", "30"))
+
+
+# ---------- helpers ----------
+NBSP = "\u00A0"
+
+def _fmt_hhmmss_ddmmyyyy(dt: datetime) -> str:
+    # 21:08:57 · 06.09.2025
+    return dt.strftime(f"%H:%M:%S{NBSP}·{NBSP}%d.%m.%Y")
+
+def _fmt_sec_human(sec) -> str:
+    try:
+        s = max(0, int(round(float(sec))))
+    except Exception:
+        s = 0
+    m, ss = divmod(s, 60)
+    h, m  = divmod(m, 60)
+    if h:  return f"{h}ч{NBSP}{m}м{NBSP}{ss}с"
+    if m:  return f"{m}м{NBSP}{ss}с"
+    return f"{ss}с"
+
+def _left(used, limit_):
+    try:
+        return max(0, int(round(float(limit_) - float(used))))
+    except Exception:
+        return 0
+
+def _calc_left(used: float, limit_: float) -> int:
+    return max(0, int(round(limit_ - used)))
+
+def _fmt_dur(sec: float | int) -> str:
+    s = max(0, int(sec or 0))
+    h, m = divmod(s, 3600)
+    m, s = divmod(m, 60)
+    if h:
+        return f"{h}мч {m}м {s}с"
+    if m:
+        return f"{m}м {s}с"
+    return f"{s}с"
+
+def _tg_env():
+    """
+    Поддерживаем оба формата ENV:
+      1) BOT_TOKEN / TG_CHAT_ID / TG_THREAD_ID
+      2) TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / TELEGRAM_THREAD_ID
+    """
+    token = (
+        os.getenv("BOT_TOKEN")
+        or os.getenv("TELEGRAM_BOT_TOKEN")
+        or ""
+    )
+    chat_id = (
+        os.getenv("TG_CHAT_ID")
+        or os.getenv("TELEGRAM_CHAT_ID")
+        or ""
+    )
+    thread_id = (
+        os.getenv("TG_THREAD_ID")
+        or os.getenv("TELEGRAM_THREAD_ID")
+        or ""
+    )
+    return token.strip(), chat_id.strip(), thread_id.strip()
+
+# def tg_send_text(text: str, parse_mode: str | None = None) -> dict | None:
+#     token = getattr(settings, "TELEGRAM_BOT_TOKEN", "")
+#     chat  = getattr(settings, "TELEGRAM_CHAT_ID", 0)
+#     if not token or not chat:
+#         return None
+#     url = f"https://api.telegram.org/bot{token}/sendMessage"
+#     payload = {
+#         "chat_id": chat,
+#         "text": text,
+#         "disable_web_page_preview": True,
+#     }
+#     if parse_mode:
+#         payload["parse_mode"] = parse_mode
+#     try:
+#         r = requests.post(url, data=payload, timeout=10)
+#         return r.json()
+#     except Exception:
+#         return None
+
+def _progress_line(title: str, pct: float, used: str, limit: str, spare: str) -> str:
+    # пример:  • ARM-count: 100%  (12/10, запас 0 шт)
+    return f"  • {title}: {int(round(pct))}%  ({used} / {limit}, запас {spare})"
+
+@shared_task(bind=True, autoretry_for=(Exception,), retry_kwargs={"max_retries": 3, "countdown": 2})
+def send_arm_report_notification(self, rpt_id: int) -> int:
+    from app.models import ArmReport
+    rpt = ArmReport.objects.get(id=rpt_id)
+
+    ts_str = (rpt.ts.astimezone(timezone.get_current_timezone())
+              .strftime("%H:%M:%S %d.%m.%Y")) if rpt.ts else "-"
+
+    board_label = f"#{getattr(rpt, 'boat_number', None) or getattr(rpt, 'boat', None) or '-'}"
+
+    pr = ArmProgress(
+        arms=int(rpt.arms or 0),
+        arm_sec=float(rpt.arm_sec or 0.0),
+        qstab_sec=float(rpt.qstab_sec or 0.0),
+    )
+
+    msg = build_arm_report_message(ts_str=ts_str, board_label=board_label, progress=pr)
+
+    # <- отправляем именно в тему ARM_REPORT_TOPIC_ID
+    thread_id = getattr(settings, "ARM_REPORT_TOPIC_ID", None)
+    res = tg_send(msg, thread_id=thread_id, parse_mode="HTML")
+
+    return 1 if (res and res.get("ok")) else 0
+
+# 
+#   Make online and telem report
+# 
 def _fmt_timedelta(td) -> str:
     total = int(td.total_seconds()) if td else 0
     if total < 0: total = 0
@@ -73,7 +204,8 @@ def check_offline_boards(self, inactive_minutes: int = 3, prolonged_minutes: int
                 f"Причина: борт выключен или потеряна связь."
             )
             try:
-                tg_send(msg)
+                thread_id = getattr(settings, "TELEGRAM_THREAD_ID", None)
+                tg_send(msg, parse_mode="HTML", thread_id=thread_id)
             except Exception:
                 logger.exception("tg_send Stage1 failed for board %s", board.id)
             board.last_offline_notified_at = now
@@ -160,7 +292,9 @@ def check_offline_boards(self, inactive_minutes: int = 3, prolonged_minutes: int
                     if points:
                         lat, lon = points[-1]
                         caption += f"\n📍 Последняя точка: {lat:.6f}, {lon:.6f}"
-                    send_resp = tg_send(caption)
+                        
+                    thread_id = getattr(settings, "TELEGRAM_THREAD_ID", None)
+                    send_resp = tg_send(caption, parse_mode="HTML", thread_id=thread_id)
 
                 if not send_resp.get("ok"):
                     logger.error("[Stage2] board=%s send failed: %s", board.id, send_resp)
@@ -168,7 +302,7 @@ def check_offline_boards(self, inactive_minutes: int = 3, prolonged_minutes: int
                     logger.info("[Stage2] board=%s send ok: %s", board.id, send_resp.get("result", {}).get("message_id"))
             except Exception:
                 logger.exception("sending Stage2 report failed for board %s", board.id)
-                tg_send(caption)
+                tg_send(caption, parse_mode="HTML")
 
             board.prolonged_offline_notified_at = now
             board.is_online = False

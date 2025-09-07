@@ -1,3 +1,4 @@
+import logging
 import io, gzip, json, math, traceback
 from typing import Dict, Any, List
 from datetime import datetime, timezone
@@ -5,6 +6,9 @@ from datetime import datetime, timezone
 from django.utils.dateparse import parse_datetime
 from django.db.models import Q
 from django.db import IntegrityError, transaction
+
+from django.utils import timezone as dj_tz
+from datetime import datetime as dt
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -14,6 +18,7 @@ from rest_framework.permissions import IsAuthenticated, IsAdminUser
 
 from api_v1.urils.telemetry_utils import maybe_mark_power_on
 from api_v1.urils.notify import tg_send
+from api_v1.tasks import send_arm_report_notification
 
 from .permissions import IsSuperUser
 
@@ -23,7 +28,7 @@ from rest_framework.parsers import MultiPartParser, FormParser
 
 from collections import defaultdict
 
-from app.models import Note, AuthUser, Category, Photo, Video, Board, Telemetry
+from app.models import ArmReport, Note, AuthUser, Category, Photo, Video, Board, Telemetry
 
 from .urils.add_reaction import add_reaction
 
@@ -43,6 +48,103 @@ from .serializers import NoteDetailSerializerBot
 
 
 # обработка запросов с бортов
+
+logger = logging.getLogger(__name__)
+
+
+def parse_ts_aware(ts_str: str):
+    """
+    Преобразует строку времени в aware datetime в текущем TZ Django.
+    Поддерживает ISO и 'YYYY-mm-dd HH:MM:SS'.
+    """
+    if not ts_str:
+        return dj_tz.now()
+    # ISO → datetime
+    try:
+        d = dt.fromisoformat(ts_str.replace(" ", "T"))
+    except Exception:
+        try:
+            d = dt.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return dj_tz.now()
+
+    if dj_tz.is_naive(d):
+        return dj_tz.make_aware(d)
+    return dj_tz.localtime(d)
+
+
+class ArmReportIngestView(APIView):
+    """
+    POST /api/v1/arm-report/
+    Ожидает gzip-NDJSON с объектами вида:
+      {"ts":"2025-09-06 18:52:28","boat":133,"arms":12,"arm_sec":60.0,"qstab_sec":30.0}
+    """
+
+    def post(self, request, *args, **kwargs):
+        try:
+            # --- читаем тело ---
+            body = request.body
+            if request.META.get("HTTP_CONTENT_ENCODING", "") == "gzip":
+                buf = io.BytesIO(body)
+                with gzip.GzipFile(fileobj=buf, mode="rb") as gz:
+                    raw = gz.read().decode("utf-8", errors="replace")
+            else:
+                raw = body.decode("utf-8", errors="replace")
+
+            lines = [l.strip() for l in raw.splitlines() if l.strip()]
+            objs = []
+            for line in lines:
+                try:
+                    obj = json.loads(line)
+                    objs.append(obj)
+                except Exception:
+                    logger.warning("arm-report: skip bad JSON line=%r", line[:200])
+
+            if not objs:
+                return Response({"error": "empty payload"}, status=status.HTTP_400_BAD_REQUEST)
+
+            saved_ids = []
+
+            with transaction.atomic():
+                for r in objs:
+                    ts_str = r.get("ts")
+                    boat = r.get("boat")
+                    arms = r.get("arms")
+                    arm_sec = r.get("arm_sec")
+                    qstab_sec = r.get("qstab_sec")
+
+                    if not (ts_str and boat is not None and arms is not None):
+                        logger.warning("arm-report: skip incomplete row %s", r)
+                        continue
+
+                    ts_dt = parse_ts_aware(ts_str)
+
+                    rpt = ArmReport.objects.create(
+                        boat_number=int(boat),
+                        ts=ts_dt,
+                        arms=int(arms),
+                        arm_sec=float(arm_sec or 0.0),
+                        qstab_sec=float(qstab_sec or 0.0),
+                    )
+                    saved_ids.append(rpt.id)
+
+            # после коммита → ставим таски
+            def _enqueue(ids):
+                for rid in ids:
+                    try:
+                        logger.info("ARM ingest: enqueue send_arm_report_notification(id=%s)", rid)
+                        send_arm_report_notification.delay(rid)
+                    except Exception:
+                        logger.exception("ARM ingest: .delay failed for id=%s", rid)
+
+            transaction.on_commit(lambda ids=list(saved_ids): _enqueue(ids))
+
+            return Response({"ok": True, "saved": len(saved_ids)}, status=status.HTTP_201_CREATED)
+
+        except Exception as e:
+            logger.exception("ArmReportIngestView.post error")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 def _nan_to_none(x):
     try:

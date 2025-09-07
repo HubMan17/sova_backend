@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.utils import timezone
 from app.models import Board
 from .notify import tg_send, tg_send_location, normalize_coords
@@ -13,17 +14,40 @@ def _power_on_criteria(p: dict) -> bool:
     if p.get("lat") is not None and p.get("lon") is not None: return True
     return False
 
+def _track_link(board_id: int, sess: str | None) -> str:
+    """
+    Ссылка на интерактивную карту:
+      - если есть sess → конкретная сессия
+      - иначе → «последняя» для борта
+    """
+    base = getattr(settings, "PUBLIC_BASE_URL", "http://127.0.0.1:8000")
+    if sess:
+        return f"{base}/api/v1/track/board/{board_id}/session/{sess}/"
+    return f"{base}/api/v1/track/board/{board_id}/last/"
+
 def _fmt_power_on_message(board: Board, payload: dict, ts) -> str:
     mode = payload.get("mode", "—")
     arm = "Да" if payload.get("arm") in (1, True) else "Нет"
+
+    # напряжение (если есть)
     volt = "—"
     if payload.get("volt") is not None:
-        try: volt = f"{float(payload['volt']):.1f} В"
-        except Exception: pass
+        try:
+            volt = f"{float(payload['volt']):.1f} В"
+        except Exception:
+            pass
+
+    # время
     ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
+
+    # coords (для текста; отдельным сообщением всё равно шлём location)
     lat, lon = normalize_coords(payload.get("lat"), payload.get("lon"))
     coords_str = f"{lat}, {lon}" if lat is not None and lon is not None else "неизвестно"
+
+    # сессия (если есть) — пригодится для ссылки
     sess = payload.get("sess") or payload.get("session") or payload.get("sess_id") or "—"
+    track_url = _track_link(board.id, None if sess == "—" else str(sess))
+
     return (
         f"🟢 <b>Борт #{board.boat_number} включился</b>\n"
         f"📅 <b>Время:</b> {ts_str}\n"
@@ -31,7 +55,8 @@ def _fmt_power_on_message(board: Board, payload: dict, ts) -> str:
         f"🔒 <b>Arm:</b> {arm}\n"
         f"🔋 <b>Напряжение:</b> {volt}\n"
         f"🧭 <b>Сессия:</b> {sess}\n"
-        f"📍 <b>Положение:</b> {coords_str}"
+        f"📍 <b>Положение:</b> {coords_str}\n"
+        f"🗺 <a href=\"{track_url}\">Открыть интерактивную карту</a>"
     )
 
 def _maybe_report_first_position_after_power_on(board: Board, payload: dict, ts) -> bool:
@@ -47,7 +72,8 @@ def _maybe_report_first_position_after_power_on(board: Board, payload: dict, ts)
         f"📅 <b>Время:</b> {ts_str}\n"
         f"🌍 <b>Координаты:</b> {lat}, {lon}"
     )
-    tg_send(msg)
+    thread_id = getattr(settings, "TELEGRAM_THREAD_ID", None)
+    tg_send(msg, thread_id=thread_id, parse_mode="HTML")
     tg_send_location(lat, lon)
     board.last_lat = lat
     board.last_lon = lon
@@ -105,7 +131,8 @@ def maybe_mark_power_on(board: Board, payload: dict, ts):
 
         board.save(update_fields=fields)
 
-        tg_send(_fmt_power_on_message(board, payload, ts))
+        thread_id = getattr(settings, "TELEGRAM_THREAD_ID", None)
+        tg_send(_fmt_power_on_message(board, payload, ts), thread_id=thread_id, parse_mode="HTML")
         if lat is not None and lon is not None:
             tg_send_location(lat, lon)
             board.last_pos_reported_at = ts
