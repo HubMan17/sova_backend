@@ -53,9 +53,10 @@ def _resolve_fields() -> Tuple[str, str, str]:
 def _fmt_dt(dt: datetime | None) -> str:
     if not dt:
         return "-"
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    # dt может быть naive (редко) или aware; приведём к aware в default TZ и выведем
+    if tz.is_naive(dt):
+        dt = tz.make_aware(dt, tz=tz.get_default_timezone())
+    return tz.localtime(dt).strftime("%H:%M:%S %d.%m.%Y")
 
 def _fmt_duration_human(sec: int) -> str:
     sec = max(0, int(sec or 0))
@@ -92,7 +93,7 @@ def _iter_points(board_id: int, sess: str):
 @require_GET
 def list_boards(request):
     rows = Board.objects.order_by("boat_number", "id").only("id", "boat_number")
-    items = [{"id": b.id, "label": f"#{b.boat_number or b.id}"} for b in rows]
+    items = [{"id": b.id, "number": b.boat_number, "label": f"#{b.boat_number or b.id}"} for b in rows]
     return JsonResponse({"boards": items}, encoder=DjangoJSONEncoder)
 
 @require_GET
@@ -108,7 +109,7 @@ def list_sessions(request, board_id: int):
     def fmt(dt):
         if not dt:
             return ""
-        return tz.localtime(dt).strftime("%Y-%m-%d %H:%M")
+        return tz.localtime(dt).strftime("%H:%M:%S %d.%m.%Y")
 
     items = []
     for r in qs:
@@ -236,16 +237,27 @@ def _session_status(points: List[Dict]) -> Tuple[str, str]:
 # =============================== VIEW: MAP =====================================
 
 @require_GET
-def board_session_map(request, board_id: int, sess: str):
-    try:
-        board = Board.objects.get(pk=board_id)
-    except Board.DoesNotExist:
-        raise Http404("Board not found")
+def board_session_map(request, boat_number: int = None, sess: str = "", board_id: int = None):
+    """
+    Если пришёл boat_number — ищем по Board.boat_number.
+    Если вдруг пришёл board_id (старые маршруты) — найдём по pk.
+    """
+    if boat_number is not None:
+        try:
+            board = Board.objects.get(boat_number=boat_number)
+        except Board.DoesNotExist:
+            raise Http404("Board not found")
+    elif board_id is not None:
+        try:
+            board = Board.objects.get(pk=board_id)
+        except Board.DoesNotExist:
+            raise Http404("Board not found")
+    else:
+        raise Http404("Bad route params")
 
-    points = _fetch_points_for_session(board_id, sess)
+    points = _fetch_points_for_session(board.id, sess)
     summary = _calc_summary(board, points)
-    sessions_all = _sessions_index(board_id, limit=200)
-
+    sessions_all = _sessions_index(board.id, limit=200)
     html = _render_map_html(
         f"Борт #{board.boat_number} — сессия {escape(sess)}",
         summary, points, board, sess, sessions_all
@@ -255,11 +267,18 @@ def board_session_map(request, board_id: int, sess: str):
 @require_GET
 def board_session_data(request, board_id: int, sess: str):
     def _dt_to_epoch(dt):
-        if not dt:
-            return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp())
+      if not dt:
+          return None
+      if tz.is_naive(dt):
+          dt = tz.make_aware(dt, tz=tz.get_default_timezone())
+      return int(dt.timestamp())
+
+    def _fmt_dt_json(dt):
+      if not dt:
+          return ""
+      if tz.is_naive(dt):
+          dt = tz.make_aware(dt, tz=tz.get_default_timezone())
+      return tz.localtime(dt).strftime("%H:%M:%S %d.%m.%Y")
 
     def _fmt_dt(dt):
         return dt.isoformat(sep=' ', timespec='seconds') if dt else ""
@@ -268,8 +287,8 @@ def board_session_data(request, board_id: int, sess: str):
     pts_payload = [{
         "lat": p.get("lat"),
         "lon": p.get("lon"),
-        "ts": _fmt_dt(p.get("ts")),
-        "ts_epoch": _dt_to_epoch(p.get("ts")),
+        "ts": _fmt_dt_json(p.get("ts")),          # уже локально
+        "ts_epoch": _dt_to_epoch(p.get("ts")),    # UTC epoch
         "alt": p.get("alt"),
         "hdg": p.get("hdg"),
         "mode": p.get("mode") or "",
@@ -381,8 +400,6 @@ def _render_map_html(title: str, summary: dict, points: list, board, sess: str, 
       <button class="btn" id="btnKml">Экспорт KML</button>
     </div>
 
-    <div class="row" style="margin-top:10px;"><div class="label">Сессии:</div></div>
-    <select id="sessSelect" style="width:100%; padding:6px 8px; border-radius:6px; border:1px solid #ddd;"></select>
   </div>
 
   <div id="toast" class="toast"></div>
@@ -396,6 +413,7 @@ def _render_map_html(title: str, summary: dict, points: list, board, sess: str, 
   const sessions    = {json.dumps(sessions_all, ensure_ascii=False, cls=DjangoJSONEncoder)};
   const currentSess = {json.dumps(sess, ensure_ascii=False, cls=DjangoJSONEncoder)};
   const boardId     = {board_id};
+  const boardNumber = {board.boat_number};
   // =============================
 
   const LOST_SECS   = {LOST_SECS};
@@ -420,7 +438,7 @@ def _render_map_html(title: str, summary: dict, points: list, board, sess: str, 
       const data = await r.json();
       const items = Array.isArray(data.boards) ? data.boards : [];
       boardSel.innerHTML = items.map(b => (
-        `<option value="${{b.id}}" ${{b.id===boardId?'selected':''}}>${{b.label}}</option>`
+        `<option value="${{b.id}}" data-number="${{b.number}}" ${{b.id===boardId?'selected':''}}>${{b.label}}</option>`
       )).join('');
       await loadSessionsFor(boardId, currentSess);
     }} catch (_) {{}}
@@ -438,19 +456,22 @@ def _render_map_html(title: str, summary: dict, points: list, board, sess: str, 
   }}
 
   boardSel.addEventListener('change', async (e) => {{
-    const newBoard = parseInt(e.target.value, 10);
-    if (!Number.isFinite(newBoard)) return;
-    await loadSessionsFor(newBoard, null);
+    const opt = e.target.selectedOptions[0];
+    if (!opt) return;
+    const newBoardId = parseInt(opt.value, 10);               // pk для API
+    const newBoardNumber = parseInt(opt.dataset.number, 10);  // номер для URL
+    await loadSessionsFor(newBoardId, null);
     const firstSess = leftSessSel.value;
     if (firstSess) {{
-      window.location.href = `/api/v1/track/board/${{newBoard}}/session/${{encodeURIComponent(firstSess)}}/`;
+      window.location.href = `/api/v1/track/board/${{newBoardNumber}}/session/${{encodeURIComponent(firstSess)}}/`;
     }}
   }});
 
   leftSessSel.addEventListener('change', (e) => {{
     const s = e.target.value;
-    const b = parseInt(boardSel.value, 10) || boardId;
-    if (s) window.location.href = `/api/v1/track/board/${{b}}/session/${{encodeURIComponent(s)}}/`;
+    const opt = boardSel.selectedOptions[0];
+    const bnum = opt ? parseInt(opt.dataset.number, 10) : boardNumber;
+    if (s) window.location.href = `/api/v1/track/board/${{bnum}}/session/${{encodeURIComponent(s)}}/`;
   }});
 
   loadBoardsAndInit();
@@ -544,7 +565,7 @@ def _render_map_html(title: str, summary: dict, points: list, board, sess: str, 
     if(!enriched.length) return "finished";
     const last=enriched[enriched.length-1];
     const now=Date.now()/1000;
-    const t  =(last.ts_epoch!=null)?last.ts_epoch:(parseTs(last.ts)?.getTime()/1000|0);
+    const t  = (last.ts_epoch!=null) ? last.ts_epoch : (parseTs(last.ts)?.getTime()/1000|0);
     if(!t) return "finished";
     const age=Math.max(0, now - t - CLOCK_SKEW);
     if(age>=FINISH_SECS) return "finished";
@@ -618,8 +639,10 @@ def _render_map_html(title: str, summary: dict, points: list, board, sess: str, 
 
   const sel = document.getElementById('sessSelect');
   sel.innerHTML = sessions.map(o => `<option value="${{o.sess}}" ${{o.sess===currentSess?'selected':''}}>${{o.label}}</option>`).join('');
-  sel.onchange = (e)=> {{ window.location.href = `/api/v1/track/board/${{boardId}}/session/${{encodeURIComponent(e.target.value)}}/`; }};
-
+  sel.onchange = (e)=> {{
+    window.location.href = `/api/v1/track/board/${{boardNumber}}/session/${{encodeURIComponent(e.target.value)}}/`;
+  }};
+  
   document.getElementById('btnGpx').onclick = ()=>{{ window.open(`/api/v1/track/export/gpx/board/${{boardId}}/session/${{encodeURIComponent(currentSess)}}/`,'_blank'); }};
   document.getElementById('btnKml').onclick = ()=>{{ window.open(`/api/v1/track/export/kml/board/${{boardId}}/session/${{encodeURIComponent(currentSess)}}/`,'_blank'); }};
 

@@ -1,7 +1,10 @@
+from django.utils.html import escape
 from django.conf import settings
 from django.utils import timezone
 from app.models import Board
 from .notify import tg_send, tg_send_location, normalize_coords
+
+from django.utils import timezone as tz
 
 def _power_on_criteria(p: dict) -> bool:
     if p.get("arm") in (1, True): return True
@@ -14,22 +17,33 @@ def _power_on_criteria(p: dict) -> bool:
     if p.get("lat") is not None and p.get("lon") is not None: return True
     return False
 
-def _track_link(board_id: int, sess: str | None) -> str:
+def _track_link(boat_number: int, sess: str | None) -> str:
     """
-    Ссылка на интерактивную карту:
-      - если есть sess → конкретная сессия
-      - иначе → «последняя» для борта
+    Публичная ссылка трека по НОМЕРУ БОРТА.
+    Если sess есть — ведём на конкретную сессию, иначе — на last.
     """
     base = getattr(settings, "PUBLIC_BASE_URL", "http://127.0.0.1:8000")
     if sess:
-        return f"{base}/api/v1/track/board/{board_id}/session/{sess}/"
-    return f"{base}/api/v1/track/board/{board_id}/last/"
+        return f"{base}/api/v1/track/board/{boat_number}/session/{sess}/"
+    return f"{base}/api/v1/track/board/{boat_number}/last/"
+
+def _to_local(dt):
+    """Приводим datetime к локальной зоне (settings.TIME_ZONE) для отображения."""
+    if not dt:
+        return None
+    if tz.is_naive(dt):
+        dt = tz.make_aware(dt, tz=tz.get_default_timezone())
+    return tz.localtime(dt)
 
 def _fmt_power_on_message(board: Board, payload: dict, ts) -> str:
-    mode = payload.get("mode", "—")
+    """
+    Формирует текст уведомления «борт включился».
+    Ссылку строим по НОМЕРУ БОРТА: если есть sess -> /session/{sess}/, иначе -> /last/.
+    """
+    mode = payload.get("mode") or "—"
     arm = "Да" if payload.get("arm") in (1, True) else "Нет"
 
-    # напряжение (если есть)
+    # напряжение
     volt = "—"
     if payload.get("volt") is not None:
         try:
@@ -37,24 +51,28 @@ def _fmt_power_on_message(board: Board, payload: dict, ts) -> str:
         except Exception:
             pass
 
-    # время
-    ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
+    # время → локально (Europe/Moscow)
+    dt_local = _to_local(ts or tz.now())
+    ts_str = dt_local.strftime("%H:%M:%S %d.%m.%Y") if dt_local else "—"
 
-    # coords (для текста; отдельным сообщением всё равно шлём location)
+    # координаты (для текста)
     lat, lon = normalize_coords(payload.get("lat"), payload.get("lon"))
-    coords_str = f"{lat}, {lon}" if lat is not None and lon is not None else "неизвестно"
+    coords_str = f"{lat}, {lon}" if (lat is not None and lon is not None) else "неизвестно"
 
-    # сессия (если есть) — пригодится для ссылки
-    sess = payload.get("sess") or payload.get("session") or payload.get("sess_id") or "—"
-    track_url = _track_link(board.id, None if sess == "—" else str(sess))
+    # сессия (как пришла из телеметрии)
+    sess = payload.get("sess") or payload.get("session") or payload.get("sess_id")
+    sess_str = escape(sess) if sess else "—"
+
+    # ссылка трека ТОЛЬКО по номеру борта
+    track_url = _track_link(board.boat_number, sess if sess else None)
 
     return (
         f"🟢 <b>Борт #{board.boat_number} включился</b>\n"
         f"📅 <b>Время:</b> {ts_str}\n"
-        f"⚙️ <b>Режим:</b> {mode}\n"
+        f"⚙️ <b>Режим:</b> {escape(mode)}\n"
         f"🔒 <b>Arm:</b> {arm}\n"
         f"🔋 <b>Напряжение:</b> {volt}\n"
-        f"🧭 <b>Сессия:</b> {sess}\n"
+        f"🧭 <b>Сессия:</b> {sess_str}\n"
         f"📍 <b>Положение:</b> {coords_str}\n"
         f"🗺 <a href=\"{track_url}\">Открыть интерактивную карту</a>"
     )
@@ -66,7 +84,11 @@ def _maybe_report_first_position_after_power_on(board: Board, payload: dict, ts)
     # already reported for current online run?
     if board.last_pos_reported_at and board.online_since and board.last_pos_reported_at >= board.online_since:
         return False
-    ts_str = (ts or timezone.now()).strftime("%Y-%m-%d %H:%M:%S")
+
+    # время → локально (Europe/Moscow)
+    dt_local = _to_local(ts or tz.now())
+    ts_str = dt_local.strftime("%H:%M:%S %d.%m.%Y") if dt_local else "—"
+
     msg = (
         f"📡 <b>Борт #{board.boat_number} обнаружен на координатах</b>\n"
         f"📅 <b>Время:</b> {ts_str}\n"
@@ -75,9 +97,11 @@ def _maybe_report_first_position_after_power_on(board: Board, payload: dict, ts)
     thread_id = getattr(settings, "TELEGRAM_THREAD_ID", None)
     tg_send(msg, thread_id=thread_id, parse_mode="HTML")
     tg_send_location(lat, lon)
+
     board.last_lat = lat
     board.last_lon = lon
-    board.last_pos_reported_at = ts or timezone.now()
+    # сохраняем «момент отправки» как aware (Django сам хранит в UTC при USE_TZ=True)
+    board.last_pos_reported_at = ts or tz.now()
     board.save(update_fields=["last_lat", "last_lon", "last_pos_reported_at"])
     return True
 

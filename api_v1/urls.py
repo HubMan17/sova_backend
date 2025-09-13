@@ -2,7 +2,7 @@
 from django.conf import settings
 from django.conf.urls.static import static
 from django.urls import path
-from .views import AuthUserDetailView, BoardMovementCreateView, BoardSectionListView, BoardSectionTransferCreateView, BoardSectionTransferHistoryView, BoardStatusActiveListView, CategoryDetailAPIViewBot
+from .views import AuthUserDetailView, BoardMovementCreateView, BoardSectionListView, BoardSectionTransferCreateView, BoardSectionTransferHistoryView, BoardStatusActiveListView, CategoryDetailAPIViewBot, delete_board_by_boat
 from .views import CustomLoginAPIView
 from .views import NewEntryAPIView
 from .views import PopularNotesAPIView
@@ -27,17 +27,36 @@ from .views_map import (
     list_boards, list_sessions,
     export_gpx, export_kml,
 )
+from .views import (
+    BoardSearchView,
+    BoardDetailView,
+    BoardSerialEnsureView,
+    BoardMovementsListView,
+    BoardStatusChangeView,
+    BoardSessionsListView,
+    BoardMaintenanceLastView,
+)
 from .views import ArmReportIngestView
 from .views import TelemetryFromJsonl
 
 from .views import BoardSerialUpsertView
+
+from .views import BoardEnsureView
+from .views import TrackBoardSessionView
+from .views import TrackBoardRecentView
+from .views import (
+    board_movements_view,
+    board_status_history_view,
+)
+from api_v1.views import board_last_maintenance_view
 
 
 urlpatterns = [
     
     path("arm-report/", ArmReportIngestView.as_view(), name="arm-report"),
     
-    path("track/board/<int:board_id>/session/<str:sess>/", board_session_map),
+    # path("track/board/<int:board_id>/session/<str:sess>/", board_session_map),
+    path("track/board/<int:boat_number>/session/<str:sess>/", board_session_map),
     path("track/data/board/<int:board_id>/session/<str:sess>/", board_session_data),
 
     path("track/boards/", list_boards),
@@ -51,6 +70,27 @@ urlpatterns = [
     
     
     # бот работа с бортами
+    path("boards/<int:boat>/", delete_board_by_boat, name="delete-board-by-boat"),
+    
+    path("boards/<int:boat>/last-maintenance/", board_last_maintenance_view, name="board-last-maintenance"),
+    
+    path("boards/<int:boat>/movements/", board_movements_view, name="board-movements"),
+    path("boards/<int:boat>/status-history/", board_status_history_view, name="board-status-history"),
+    
+    path("track/board/<int:boat>/session/<slug:sess>/", TrackBoardSessionView.as_view(), name="track-board-session"),
+    path("track/board/<int:boat>/last/", TrackBoardRecentView.as_view(), name="track-board-last"),
+    
+    path("boards/<int:boat>/ensure/", BoardEnsureView.as_view(), name="boards-ensure"),
+    
+    path("boards/search/", BoardSearchView.as_view(), name="boards-search"),
+    path("boards/<int:boat>/detail/", BoardDetailView.as_view(), name="boards-detail"),
+    path("boards/<int:boat>/serial/ensure/", BoardSerialEnsureView.as_view(), name="boards-serial-ensure"),
+    path("boards/<int:boat>/movements/", BoardMovementsListView.as_view(), name="boards-movements"),
+    path("boards/<int:boat>/status/set/", BoardStatusChangeView.as_view(), name="boards-status-set"),
+    path("boards/<int:boat>/sessions/", BoardSessionsListView.as_view(), name="boards-sessions"),
+    path("boards/<int:boat>/maintenance/last/", BoardMaintenanceLastView.as_view(), name="boards-maintenance-last"),
+    
+    
     path("boards/statuses/active/", BoardStatusActiveListView.as_view(), name="boards-statuses-active"),
     path("boards/sections/list/", BoardSectionListView.as_view(), name="boards-sections-list"),
     

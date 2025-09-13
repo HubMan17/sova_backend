@@ -140,6 +140,120 @@ SECTION_TO_STATUS = {
     # при необходимости добавь другие: "section3": ("accepted_section3", "Принят на 3-й участок")
 }
 
+class BoardSearchInSerializer(serializers.Serializer):
+    boat = serializers.IntegerField()
+
+class BoardMiniSerializer(serializers.ModelSerializer):
+    current_section = serializers.SerializerMethodField()
+    status_name = serializers.SerializerMethodField()
+
+    # Эти три — вернём строкой .name (или None)
+    flight_controller = serializers.SerializerMethodField()
+    link_type = serializers.SerializerMethodField()
+    freq = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Board
+        fields = (
+            "id",
+            "boat_number",
+            "serial_number",
+            "is_online",
+            "last_telemetry_at",
+            "current_sess",
+            "current_section",
+            "status_name",
+            "flight_controller",
+            "link_type",
+            "freq",
+        )
+
+    def get_current_section(self, obj):
+        if obj.current_section:
+            return {"code": obj.current_section.code, "name": obj.current_section.name}
+        return None
+
+    def get_status_name(self, obj):
+        return obj.status.name if obj.status else None
+
+    def get_flight_controller(self, obj):
+        return obj.flight_controller.name if obj.flight_controller else None
+
+    def get_link_type(self, obj):
+        return obj.link_type.name if obj.link_type else None
+
+    def get_freq(self, obj):
+        return obj.freq.name if obj.freq else None
+
+class BoardSerialEnsureInSerializer(serializers.Serializer):
+    # опционально можно принять желаемый серийник вручную
+    serial_number = serializers.CharField(required=False, allow_blank=True)
+
+class BoardSerialEnsureOutSerializer(serializers.Serializer):
+    serial_number = serializers.CharField()
+    created = serializers.BooleanField()
+
+class BoardMovementsItemSerializer(serializers.ModelSerializer):
+    previous_status = serializers.SerializerMethodField()
+    new_status = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BoardMovement
+        fields = ("id", "previous_status", "new_status", "notes", "source", "submitted_display", "created_at", "effective_at")
+
+    def get_previous_status(self, obj):
+        return None if not obj.previous_status else {"code": obj.previous_status.code, "name": obj.previous_status.name}
+
+    def get_new_status(self, obj):
+        return {"code": obj.new_status.code, "name": obj.new_status.name}
+
+class BoardStatusChangeInSerializer(serializers.Serializer):
+    status_code = serializers.SlugField()
+    notes = serializers.CharField(required=False, allow_blank=True, default="")
+    author = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    source = serializers.CharField(required=False, allow_blank=True, default="api")
+    effective_at = serializers.DateTimeField(required=False, allow_null=True)
+    context = serializers.JSONField(required=False)
+
+    @transaction.atomic
+    def create(self, validated_data):
+        boat = self.context["boat"]
+        board, _created = Board.objects.select_for_update().get_or_create(boat_number=boat)
+        try:
+            new_status = BoardStatus.objects.get(code=validated_data["status_code"])
+        except BoardStatus.DoesNotExist:
+            raise serializers.ValidationError({"status_code": "Статус с таким кодом не найден."})
+
+        prev_status_obj = board.status  # теперь это объект или None
+
+        submitted_by = None
+        submitted_display = validated_data.get("author") or "unknown"
+
+        mv = BoardMovement.objects.create(
+            board=board,
+            previous_status=prev_status_obj,
+            new_status=new_status,
+            notes=validated_data.get("notes") or "",
+            source=validated_data.get("source") or "api",
+            submitted_by=submitted_by,
+            submitted_display=submitted_display,
+            context=validated_data.get("context") or {},
+            effective_at=validated_data.get("effective_at"),
+        )
+
+        board.status = new_status  # ⬅️ важная правка
+        board.save(update_fields=["status"])
+        return mv
+
+class BoardSessionsOutSerializer(serializers.Serializer):
+    current_sess = serializers.CharField(allow_null=True)
+    sessions = serializers.ListField(child=serializers.DictField(), allow_empty=True)  # хук под твою модель сессий
+
+class BoardMaintenanceOutSerializer(serializers.Serializer):
+    # если будет своя модель ТО – сюда перенесём
+    last_maintenance = serializers.DictField(allow_null=True)
+
+
 class BoardSectionTransferCreateSerializer(serializers.Serializer):
     boat = serializers.IntegerField()
     to_section_code = serializers.SlugField()
@@ -148,34 +262,41 @@ class BoardSectionTransferCreateSerializer(serializers.Serializer):
     author = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     context = serializers.JSONField(required=False)
     effective_at = serializers.DateTimeField(required=False, allow_null=True)
-    from_section_code = serializers.SlugField(required=False, allow_blank=True, allow_null=True)
 
     @transaction.atomic
     def create(self, validated_data):
-        from app.models import Board, BoardSection, BoardSectionTransfer  # поправь путь
+        from app.models import Board, BoardSection, BoardSectionTransfer
+
         boat = validated_data["boat"]
         to_code = validated_data["to_section_code"]
         notes = validated_data.get("notes") or ""
         source = validated_data.get("source") or "api"
         context = validated_data.get("context") or {}
         effective_at = validated_data.get("effective_at")
-        from_code = validated_data.get("from_section_code") or None
 
-        board = Board.objects.get(boat_number=boat)
-        to_section = BoardSection.objects.get(code=to_code)
+        # 1) Получаем/создаём борт под блокировкой
+        board, _created = Board.objects.select_for_update().get_or_create(
+            boat_number=boat,
+            defaults={
+                # все поля у Board либо nullable, либо с default — ничего обязательного добавлять не нужно
+            },
+        )
 
-        # определить from_section: явный параметр или текущее поле у board (если есть)
-        from_section = None
-        if from_code:
-            from_section = BoardSection.objects.filter(code=from_code).first()
-        elif hasattr(board, "current_section_id"):
-            from_section = board.current_section
+        # 2) Валидируем целевую секцию
+        try:
+            to_section = BoardSection.objects.get(code=to_code)
+        except BoardSection.DoesNotExist:
+            raise serializers.ValidationError({"to_section_code": "Секция с таким кодом не найдена."})
+
+        # 3) Предыдущая секция для лога
+        prev_section = board.current_section
 
         submitted_by, submitted_display = resolve_submitted_user(validated_data.get("author"))
 
-        tr = BoardSectionTransfer.objects.create(
+        # 4) Создаём запись перевода
+        transfer = BoardSectionTransfer.objects.create(
             board=board,
-            from_section=from_section,
+            from_section=prev_section,
             to_section=to_section,
             notes=notes,
             source=source,
@@ -185,13 +306,11 @@ class BoardSectionTransferCreateSerializer(serializers.Serializer):
             effective_at=effective_at,
         )
 
-        # синхронизируем текущее поле у Board, если есть
-        if hasattr(board, "current_section_id") and board.current_section_id != to_section.id:
-            board.current_section = to_section
-            board.save(update_fields=["current_section"])
+        # 5) Обновляем текущую секцию у борта
+        board.current_section = to_section
+        board.save(update_fields=["current_section"])
 
-        # (если нужен автостатус по маппингу, оставь как было)
-        return tr
+        return transfer
 
 class BoardSectionTransferOutSerializer(serializers.ModelSerializer):
     board = serializers.SerializerMethodField()
@@ -280,9 +399,6 @@ class BoardMovementCreateSerializer(serializers.Serializer):
 
     @transaction.atomic
     def create(self, validated_data):
-        # поправь импорт под твои пути
-        from app.models import Board, BoardStatus, BoardMovement
-
         boat = validated_data["boat"]
         new_code = validated_data["status_code"]
         notes = validated_data.get("notes") or ""
@@ -290,23 +406,21 @@ class BoardMovementCreateSerializer(serializers.Serializer):
         context = validated_data.get("context") or {}
         effective_at = validated_data.get("effective_at")
 
-        # блокируем строку борта, чтобы не было гонок
-        board = Board.objects.select_for_update().get(boat_number=boat)
+        board, _ = Board.objects.select_for_update().get_or_create(boat_number=boat)
 
-        # новый статус — объект
-        new_status = BoardStatus.objects.get(code=new_code)
+        try:
+            new_status = BoardStatus.objects.get(code=new_code)
+        except BoardStatus.DoesNotExist:
+            raise serializers.ValidationError({"status_code": "Статус с таким кодом не найден."})
 
-        # предыдущий статус борта хранится у Board как строковый код -> ищем объект (или None)
-        prev_status_obj = None
-        prev_code = getattr(board, "status", None)
-        if prev_code:
-            prev_status_obj = BoardStatus.objects.filter(code=prev_code).first()
+        prev_status_obj = board.status  # объект или None
 
-        submitted_by, submitted_display = resolve_submitted_user(validated_data.get("author"))
+        submitted_by = None
+        submitted_display = validated_data.get("author")
 
         mv = BoardMovement.objects.create(
             board=board,
-            previous_status=prev_status_obj,  # <-- ВАЖНО: объект, а не строка
+            previous_status=prev_status_obj,
             new_status=new_status,
             notes=notes,
             source=source,
@@ -316,10 +430,8 @@ class BoardMovementCreateSerializer(serializers.Serializer):
             effective_at=effective_at,
         )
 
-        # синхронизируем текущий код статуса в самой Board
-        board.status = new_status.code
+        board.status = new_status  # ⬅️ объект
         board.save(update_fields=["status"])
-
         return mv
 
 

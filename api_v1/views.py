@@ -1,7 +1,14 @@
 import logging
 import io, gzip, json, math, traceback
 from typing import Dict, Any, List
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+from rest_framework.decorators import api_view
+
+from django.views.decorators.http import require_GET
+from django.http import Http404, JsonResponse
+from django.utils import timezone as tz
+from django.shortcuts import get_object_or_404
 
 from django.utils.dateparse import parse_datetime
 from django.db.models import Q
@@ -9,6 +16,7 @@ from django.db import IntegrityError, transaction
 
 from django.utils import timezone as dj_tz
 from datetime import datetime as dt
+from django.utils import timezone as timezone_tz
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -29,9 +37,10 @@ from rest_framework.parsers import MultiPartParser, FormParser
 from collections import defaultdict
 
 from app.models import (
-    ArmReport, BoardSection, BoardStatus, Note, AuthUser, Category, Photo, Video, Board, Telemetry,
+    ArmReport, BoardMovement, BoardSection, BoardStatus, Note, AuthUser, Category, Photo, Video, Board, Telemetry,
     BoardSectionTransfer
 )
+from api_v1.urils.route_query import get_last_n_points, get_route_points_by_session, get_recent_route_points, detect_latest_session
 
 from .urils.add_reaction import add_reaction
 
@@ -53,6 +62,12 @@ from .serializers import BoardMovementOutSerializer
 from .serializers import (
     BoardSectionTransferCreateSerializer,
     BoardSectionTransferOutSerializer,
+)
+from .serializers import (
+    BoardSearchInSerializer, BoardMiniSerializer,
+    BoardSerialEnsureInSerializer, BoardSerialEnsureOutSerializer,
+    BoardMovementsItemSerializer, BoardStatusChangeInSerializer,
+    BoardSessionsOutSerializer, BoardMaintenanceOutSerializer,
 )
 
 
@@ -230,10 +245,8 @@ class TelemetryFromJsonl(APIView):
                         continue
 
                     # борт (создадим при первом сообщении)
-                    board, _ = Board.objects.get_or_create(
-                        boat_number=int(boat),
-                        defaults={"status": "active"},
-                    )
+                    board, _ = Board.objects.get_or_create(boat_number=int(boat))
+                    
                     boards_touched.add(board.boat_number)
 
                     ts, ts_epoch = _ts_from_payload(obj)
@@ -308,9 +321,342 @@ class TelemetryFromJsonl(APIView):
     def get(self, request, *args, **kwargs):
         return Response({"status": "ok"}, status=200)
 
+
+class AuthMixin:
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+    
+    
 """
-апи для бота
+---------------------------------------------
+                апи для бота
+---------------------------------------------
 """
+@api_view(["DELETE"])
+# при необходимости включите аутентификацию/права:
+# @authentication_classes([TokenAuthentication])
+# @permission_classes([IsAuthenticated])
+def delete_board_by_boat(request, boat: int):
+    """
+    DELETE /api/v1/boards/<boat>/
+    <boat> — НОМЕР борта (Board.boat_number).
+    Удаляет запись борта. Возвращает 204 при успехе.
+    """
+    board = Board.objects.filter(boat_number=boat).first()
+    if not board:
+        return Response({"ok": False, "error": "board not found"}, status=status.HTTP_404_NOT_FOUND)
+
+    # жёсткое удаление; если нужна "мягкая" пометка — замените на флаг и save()
+    board.delete()
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@require_GET
+def board_last_maintenance_view(request, boat: int):
+    """
+    GET /api/v1/boards/<boat>/last-maintenance/
+    Возвращает самый свежий ArmReport для указанного НОМЕРА борта.
+    Если отчётов нет — item=None.
+    """
+    # номер борта обязателен (мы не ищем по pk)
+    board = Board.objects.filter(boat_number=boat).first()
+    if not board:
+        raise Http404("board not found")
+
+    rep = (
+        ArmReport.objects
+        .filter(boat_number=boat)
+        .order_by("-ts")            # самый свежий
+        .first()
+    )
+
+    if not rep:
+        return JsonResponse({"ok": True, "item": None}, status=200)
+
+    ts_local = tz.localtime(rep.ts) if rep.ts and tz.is_aware(rep.ts) else rep.ts
+    item = {
+        "at": ts_local.strftime("%Y-%m-%d %H:%M:%S") if ts_local else "",
+        "arms": rep.arms,
+        "arm_sec": rep.arm_sec,
+        "qstab_sec": rep.qstab_sec,
+    }
+    return JsonResponse({"ok": True, "item": item}, status=200)
+
+
+def _human(u):
+    if not u:
+        return ""
+    return getattr(u, "get_full_name", lambda: "")() or getattr(u, "name", "") or str(u)
+
+def _sec_name(sec):
+    if not sec:
+        return ""
+    return getattr(sec, "name", None) or getattr(sec, "title", None) or str(sec)
+
+@require_GET
+def board_movements_view(request, boat: int):
+    """
+    GET /api/v1/boards/<boat>/movements/
+    Возвращает последние перемещения борта: [{at, from, to, by}]
+    """
+    board = Board.objects.filter(boat_number=boat).first()
+    if not board:
+        raise Http404("board not found")
+
+    qs = (
+        BoardSectionTransfer.objects
+        .filter(board=board)
+        .select_related("from_section", "to_section", "submitted_by")
+        .order_by("-created_at")[:50]
+    )
+
+    items = []
+    for m in qs:
+        at = m.created_at or m.__dict__.get("created_at")
+        items.append({
+            "at": tz.localtime(at).strftime("%Y-%m-%d %H:%M:%S") if at else "",
+            "from": _sec_name(getattr(m, "from_section", None)) or (getattr(m, "from_place", None) or ""),
+            "to": _sec_name(getattr(m, "to_section", None)) or (getattr(m, "to_place", None) or ""),
+            "by": _human(getattr(m, "submitted_by", None)) or (getattr(m, "submitted_display", "") or ""),
+        })
+
+    return JsonResponse({"ok": True, "items": items})
+
+@require_GET
+def board_status_history_view(request, boat: int):
+    """
+    GET /api/v1/boards/<boat>/status-history/
+    История передач борта между участками: [{at, from, to, by}]
+    """
+    board = Board.objects.filter(boat_number=boat).first()
+    if not board:
+        raise Http404("board not found")
+
+    qs = (
+        BoardMovement.objects
+        .filter(board=board)
+        .select_related("previous_status", "new_status", "submitted_by")
+        .order_by("-effective_at", "-created_at")[:50]  # ВАЖНО: здесь НЕТ transferred_at
+    )
+
+    items = []
+    for t in qs:
+        at = t.effective_at or t.created_at
+        items.append({
+            "at": tz.localtime(at).strftime("%Y-%m-%d %H:%M:%S") if at else "",
+            "from": _sec_name(getattr(t, "previous_status", None)),
+            "to": _sec_name(getattr(t, "new_status", None)),
+            "by": _human(getattr(t, "submitted_by", None)) or (getattr(t, "submitted_display", "") or ""),
+        })
+
+    return JsonResponse({"ok": True, "items": items})
+
+class BoardMovementsView(APIView):
+    """
+    GET /api/v1/boards/<boat>/movements/
+    История передвижений борта
+    """
+    def get(self, request, boat: int):
+        board = get_object_or_404(Board, boat_number=boat)
+        qs = BoardMovement.objects.filter(board=board).order_by("-moved_at")[:20]  # последние 20
+        items = []
+        for x in qs:
+            items.append({
+                "from": getattr(x.from_section, "name", None),
+                "to": getattr(x.to_section, "name", None),
+                "at": tz.localtime(x.moved_at).strftime("%Y-%m-%d %H:%M"),
+                "by": getattr(x.moved_by, "username", None) if hasattr(x, "moved_by") else None,
+            })
+        return Response({"ok": True, "items": items})
+
+
+class BoardStatusHistoryView(APIView):
+    """
+    GET /api/v1/boards/<boat>/status-history/
+    История статусов (передача между участками)
+    """
+    def get(self, request, boat: int):
+        board = get_object_or_404(Board, boat_number=boat)
+        qs = BoardSectionTransfer.objects.filter(board=board).order_by("-transferred_at")[:20]
+        items = []
+        for x in qs:
+            items.append({
+                "from": getattr(x.from_section, "name", None),
+                "to": getattr(x.to_section, "name", None),
+                "at": tz.localtime(x.transferred_at).strftime("%Y-%m-%d %H:%M"),
+                "by": getattr(x.transferred_by, "username", None) if hasattr(x, "transferred_by") else None,
+            })
+        return Response({"ok": True, "items": items})
+
+class TrackBoardSessionView(APIView):
+    """
+    GET /api/v1/track/board/<boat>/session/<sess>/
+    <boat> — ЭТО НОМЕР БОРТА (boat_number), НЕ pk.
+    """
+    def get(self, request, boat: int, sess: str):
+        # 1) находим борд по номеру
+        board = Board.objects.filter(boat_number=boat).first()
+        if not board:
+            return Response({"ok": False, "error": "board not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        # 2) строим трек по board.id
+        points = get_route_points_by_session(board.id, sess, max_points=200)
+        return Response({"ok": True, "boat": boat, "session": sess, "points": points}, status=200)
+
+
+class TrackBoardRecentView(APIView):
+    """
+    GET /api/v1/track/board/<boat>/last/
+    <boat> — НОМЕР БОРТА. Возвращает трек последней сессии за ВСЁ время.
+    Если сессий нет — отдаёт последние точки (до 200).
+    """
+    def get(self, request, boat: int):
+        board = Board.objects.filter(boat_number=boat).first()
+        if not board:
+            return Response({"ok": False, "error": "board not found"}, status=404)
+
+        # 1) если у борта сейчас есть активная сессия — используем её
+        sess = (board.current_sess or
+                Telemetry.objects.filter(board_id=board.id)
+                .exclude(sess__isnull=True).exclude(sess="")
+                .order_by("-ts")
+                .values_list("sess", flat=True)
+                .first())
+
+        if sess:
+            pts = get_route_points_by_session(board.id, sess)
+            return Response({"ok": True, "boat": boat, "session": sess, "points": pts}, status=200)
+
+        # 2) сессий нет вовсе — отдадим просто последние точки (до 200)
+        pts = get_last_n_points(board.id, n=200)
+        return Response({"ok": True, "boat": boat, "session": None, "points": pts}, status=200)
+
+
+class BoardEnsureView(AuthMixin, APIView):
+    """
+    POST /boards/<boat>/ensure/
+    -> { ok, created, item }
+    """
+    @transaction.atomic
+    def post(self, request, boat: int):
+        board, created = Board.objects.select_for_update().get_or_create(boat_number=boat)
+        data = BoardMiniSerializer(board).data
+        return Response({"ok": True, "created": created, "item": data}, status=status.HTTP_200_OK)
+
+class BoardSearchView(AuthMixin, APIView):
+    """
+    POST {"boat": 400}
+    -> 200 { ok: true, found: true/false, item?: {...} }
+    """
+    def post(self, request):
+        ser = BoardSearchInSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        boat = ser.validated_data["boat"]
+        try:
+            board = Board.objects.select_related("current_section").get(boat_number=boat)
+            out = BoardMiniSerializer(board).data
+            return Response({"ok": True, "found": True, "item": out}, status=status.HTTP_200_OK)
+        except Board.DoesNotExist:
+            return Response({"ok": True, "found": False}, status=status.HTTP_200_OK)
+
+class BoardDetailView(AuthMixin, APIView):
+    """
+    GET /boards/<boat>/detail/
+    """
+    def get(self, request, boat: int):
+        try:
+            board = Board.objects.select_related("current_section").get(boat_number=boat)
+        except Board.DoesNotExist:
+            return Response({"ok": False, "error": "BOARD_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"ok": True, "item": BoardMiniSerializer(board).data}, status=status.HTTP_200_OK)
+
+class BoardSerialEnsureView(AuthMixin, APIView):
+    """
+    POST /boards/<boat>/serial/ensure/
+    body: {"serial_number": "optional"}
+    -> 200 { ok, serial_number, created }
+    Если у борта пустой serial_number — проставим (сгенерируем или возьмём из тела).
+    """
+    @transaction.atomic
+    def post(self, request, boat: int):
+        ser = BoardSerialEnsureInSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        board, _ = Board.objects.select_for_update().get_or_create(boat_number=boat)
+        created = False
+
+        if not board.serial_number:
+            sn = ser.validated_data.get("serial_number") or generate_serial(boat)
+            board.serial_number = sn
+            board.save(update_fields=["serial_number"])
+            created = True
+
+        out = BoardSerialEnsureOutSerializer({"serial_number": board.serial_number, "created": created}).data
+        return Response({"ok": True, "item": out}, status=status.HTTP_200_OK)
+
+class BoardMovementsListView(AuthMixin, APIView):
+    """
+    GET /boards/<boat>/movements/?limit=20
+    """
+    def get(self, request, boat: int):
+        limit = int(request.query_params.get("limit", 20))
+        try:
+            board = Board.objects.get(boat_number=boat)
+        except Board.DoesNotExist:
+            return Response({"ok": False, "error": "BOARD_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+
+        qs = (BoardMovement.objects
+              .filter(board=board)
+              .select_related("previous_status", "new_status")
+              .order_by("-created_at")[:limit])
+        items = BoardMovementsItemSerializer(qs, many=True).data
+        return Response({"ok": True, "items": items}, status=status.HTTP_200_OK)
+
+class BoardStatusChangeView(AuthMixin, APIView):
+    """
+    POST /boards/<boat>/status/set/
+    body: {status_code, notes?, author?, source?, effective_at?, context?}
+    -> 201 { ok: true, movement: {...} }
+    """
+    def post(self, request, boat: int):
+        ser = BoardStatusChangeInSerializer(data=request.data, context={"boat": boat})
+        ser.is_valid(raise_exception=True)
+        mv = ser.save()
+        out = BoardMovementsItemSerializer(mv).data
+        return Response({"ok": True, "movement": out}, status=status.HTTP_201_CREATED)
+
+class BoardSessionsListView(AuthMixin, APIView):
+    """
+    GET /boards/<boat>/sessions/
+    -> 200 { ok, item: { current_sess, sessions: [...] } }
+    Сейчас отдаём current_sess с борта; список sessions оставляем пустым или наполняем,
+    если у тебя появится модель сессий.
+    """
+    def get(self, request, boat: int):
+        try:
+            board = Board.objects.get(boat_number=boat)
+        except Board.DoesNotExist:
+            return Response({"ok": False, "error": "BOARD_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+
+        payload = {"current_sess": board.current_sess, "sessions": []}
+        # TODO: если появится модель TelemetrySession, тут сделаем выборку и заполним sessions
+        return Response({"ok": True, "item": BoardSessionsOutSerializer(payload).data}, status=status.HTTP_200_OK)
+
+class BoardMaintenanceLastView(AuthMixin, APIView):
+    """
+    GET /boards/<boat>/maintenance/last/
+    -> 200 { ok, item: { last_maintenance: {...} | null } }
+    Заглушка: вернёт null, пока не определим модель ТО.
+    """
+    def get(self, request, boat: int):
+        try:
+            Board.objects.only("id").get(boat_number=boat)
+        except Board.DoesNotExist:
+            return Response({"ok": False, "error": "BOARD_NOT_FOUND"}, status=status.HTTP_404_NOT_FOUND)
+
+        # TODO: подключить фактическую модель ТО, например BoardMaintenance
+        data = {"last_maintenance": None}
+        return Response({"ok": True, "item": BoardMaintenanceOutSerializer(data).data}, status=status.HTTP_200_OK)
+
 
 class BoardStatusActiveListView(APIView):
     """

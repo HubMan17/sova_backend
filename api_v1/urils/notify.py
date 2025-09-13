@@ -2,10 +2,13 @@ import json
 import os
 import re
 from django.conf import settings
+from dotenv import load_dotenv
 import requests
 import logging
 from .route_map import build_yandex_route_url_v1
 from urllib.parse import quote_plus
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 

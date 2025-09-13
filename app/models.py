@@ -8,13 +8,75 @@ from django.contrib.auth.models import AbstractBaseUser, BaseUserManager
 # работа с бортами
 from django.db import models
 
+class BoardStatus(models.Model):
+    code = models.SlugField(max_length=50, unique=True, db_index=True)
+    name = models.CharField(max_length=100)
+    description = models.TextField(blank=True, null=True)
+    order = models.PositiveIntegerField(default=100)
+    is_active = models.BooleanField(default=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "board_statuses"
+        ordering = ["order", "id"]
+
+    def __str__(self):
+        return f"{self.name} ({self.code})"
+
+class FlightController(models.Model):
+    name = models.CharField(max_length=100, unique=True, db_index=True)
+
+    class Meta:
+        db_table = "flight_controllers"
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+class LinkType(models.Model):
+    name = models.CharField(max_length=100, unique=True, db_index=True)
+
+    class Meta:
+        db_table = "link_types"
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+class FrequencyBand(models.Model):
+    name = models.CharField(max_length=100, unique=True, db_index=True)
+
+    class Meta:
+        db_table = "frequency_bands"
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
 class Board(models.Model):
     boat_number = models.IntegerField(unique=True)
     serial_number = models.CharField(max_length=100, blank=True, null=True)
-    flight_controller = models.CharField(max_length=100, blank=True, null=True)
-    link_type = models.CharField(max_length=100, blank=True, null=True)
-    freq = models.CharField(max_length=100, blank=True, null=True)
-    status = models.CharField(max_length=50, blank=True, null=True)
+    flight_controller = models.ForeignKey(
+        "FlightController", on_delete=models.SET_NULL, null=True, blank=True, related_name="boards"
+    )
+    link_type = models.ForeignKey(
+        "LinkType", on_delete=models.SET_NULL, null=True, blank=True, related_name="boards"
+    )
+    freq = models.ForeignKey(
+        "FrequencyBand", on_delete=models.SET_NULL, null=True, blank=True, related_name="boards"
+    )
+    status = models.ForeignKey(
+        BoardStatus,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="boards",
+        db_index=True,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     # online summary
@@ -105,24 +167,6 @@ class BoardSectionTransfer(models.Model):
 
     def __str__(self):
         return f"Board #{self.board.boat_number}: {self.from_section} -> {self.to_section}"
-
-
-class BoardStatus(models.Model):
-    code = models.SlugField(max_length=50, unique=True, db_index=True)
-    name = models.CharField(max_length=100)
-    description = models.TextField(blank=True, null=True)
-    order = models.PositiveIntegerField(default=100)
-    is_active = models.BooleanField(default=True)
-
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = "board_statuses"
-        ordering = ["order", "id"]
-
-    def __str__(self):
-        return f"{self.name} ({self.code})"
 
 
 class BoardMovement(models.Model):

@@ -4,6 +4,8 @@ from django.db.models import Q
 
 from datetime import datetime, timezone as dt_tz
 
+from dotenv import load_dotenv
+
 from api_v1.urils.notify_format import ArmProgress, build_arm_report_message
 
 from celery import shared_task
@@ -26,6 +28,8 @@ from celery import shared_task
 from django.utils import timezone as tz
 from django.db import transaction
 
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -157,11 +161,16 @@ def _fmt_timedelta(td) -> str:
     return f"{s}s"
 
 
-def _track_link(board_id: int, sess: str | None) -> str:
+def _track_link(boat_number: int, sess: str | None) -> str:
+    """
+    Формирует публичную ссылку трека по НОМЕРУ БОРТА (boat_number), не по pk.
+    Если sess есть — ведём на конкретную сессию.
+    Если sess нет — ведём на "last" (последний полёт).
+    """
     base = getattr(settings, "PUBLIC_BASE_URL", "http://127.0.0.1:8000")
     if sess:
-        return f"{base}/api/v1/track/board/{board_id}/session/{sess}/"
-    return f"{base}/api/v1/track/board/{board_id}/last/"
+        return f"{base}/api/v1/track/board/{boat_number}/session/{sess}/"
+    return f"{base}/api/v1/track/board/{boat_number}/last/"
 
 @shared_task(bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=3)
 def check_offline_boards(self, inactive_minutes: int = 3, prolonged_minutes: int = 10) -> int:
@@ -242,6 +251,9 @@ def check_offline_boards(self, inactive_minutes: int = 3, prolonged_minutes: int
             start_ts = board.online_since or (last_ts or now)
             end_ts = last_ts or now
 
+            start_local = tz.localtime(start_ts) if start_ts else None
+            end_local   = tz.localtime(end_ts)   if end_ts   else None
+
             # 1) сначала пытаемся строго по сессии
             sess = getattr(board, "current_sess", None) or detect_latest_session(board.id, start_ts, end_ts)
             points = get_route_points_by_session(board.id, sess, max_points=200) if sess else []
@@ -260,8 +272,8 @@ def check_offline_boards(self, inactive_minutes: int = 3, prolonged_minutes: int
             distance_m = total_distance_m(points) if len(points) >= 2 else 0.0
             distance_km = distance_m / 1000.0
 
-            start_str = start_ts.strftime("%Y-%m-%d %H:%M:%S") if start_ts else "—"
-            last_str = end_ts.strftime("%Y-%m-%d %H:%M:%S") if end_ts else "—"
+            start_str = start_local.strftime("%H:%M:%S %d.%m.%Y") if start_local else "—"
+            last_str  = end_local.strftime("%H:%M:%S %d.%m.%Y")  if end_local  else "—" 
 
             caption = (
                 f"🔴 Борт #{board.boat_number} так и не вышел на связь\n"
@@ -272,7 +284,7 @@ def check_offline_boards(self, inactive_minutes: int = 3, prolonged_minutes: int
                 f"📏 Пройденная дистанция: {distance_km:.2f} км"
             )
 
-            track_url = _track_link(board.id, sess if len(points) >= 2 else None)
+            track_url = _track_link(board.boat_number, sess if len(points) >= 2 else None)
             caption = (
                 f"🔴 Борт #{board.boat_number} так и не вышел на связь\n"
                 f"🧭 Сессия: {sess or '—'}\n"
